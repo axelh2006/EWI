@@ -1,5 +1,5 @@
 // ---------------------------------------*** ISOFLUTE by Axel Henriksson ***----------------------------------------------
-// An electronic wind instrument MIDI controller with an isomorphic keyboard based on ESP-S3 and the Arduino framework
+// An electronic wind instrument MIDI controller with an isomorphic keyboard based on ESP-S3 and the Arduino framework 
 
 #if ARDUINO_USB_MODE
 #error "USB mode is still 1 (hardware CDC/JTAG), not TinyUSB"
