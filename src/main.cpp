@@ -11,6 +11,7 @@
 #include <USBMIDI.h>
 #include <Button2.h>
 #include <Adafruit_LPS28.h>
+#include <Adafruit_ADXL345_U.h>
 #include <U8g2lib.h>
 #include <mappings.h>
 
@@ -46,6 +47,23 @@ float rest;
 const float pressure_deadzone_hpa = 1.2f;
 const float pressure_range_hpa = 12.0f;
 
+Adafruit_ADXL345_Unified acc = Adafruit_ADXL345_Unified();
+
+const float bend_full = 30.0f;
+const float bend_deadzone = 4.0f;
+
+float tilt_ref = 0;
+float tilt_smooth = 0;
+uint16_t last_bend = 8192;
+uint32_t bend_time = 0;
+
+float ax = 0.0;
+float ay = 0.0;
+float az = 0.0;
+
+float tilt = 0.0;
+int bend = 0;
+
 uint8_t  last_pressure_sent = 255;      // 255 forces the first send
 uint32_t last_pressure_time = 0;
 
@@ -69,6 +87,12 @@ uiState ui = UI_OCT;
 const uint8_t ui_items = 2;
 const uint16_t long_press = 300; // Milliseconds
 bool need_full = true;
+int bend_ind = 6;
+
+bool anyNoteSounding() {
+  for (uint8_t k = 0; k < 32; k++) if (sounding_note[k] != 255) return true;
+  return false;
+}
 
 void sendNote(bool on, uint8_t note, uint8_t vel) {
   vel = constrain(vel, 1, 127);
@@ -96,6 +120,68 @@ void releaseAll() {
   }
 }
 
+void sendPitchBend(int16_t value) { // Pitch Bend, 0 - 16383, 8192 = centre
+  value = constrain(value, 0, 16383);
+  // HID
+  uint8_t msg[3] = { (uint8_t)(0xE0 | ((midi_channel - 1) & 0x0F)),
+                     (uint8_t)(value & 0x7F),
+                     (uint8_t)(value >> 7) };
+  Serial1.write(msg, 3);
+  // USB
+  usb_midi.pitchBend(-((float)value - 8192.0f) / 8192.0f, midi_channel);
+}
+
+void captureTiltRef() {
+  tilt_ref = tilt_smooth;
+  last_bend = 8192;
+  sendPitchBend(8192);
+}
+
+float readAngle() {
+  ax = acc.getX();
+  ay = acc.getY();
+  az = acc.getZ();
+
+  tilt = atan2(ay, az) * 180.0 / PI;
+
+  return tilt;
+}
+
+float angleDiff(float current, float reference) {
+  float d = current - reference;
+  if (d > 180.0f) d -= 360.0f;
+  else if (d < -180.0f) d += 360.0f;
+  return d;
+}
+
+void updateTilt() {
+  static uint32_t last_read = 0;
+  uint32_t now = millis();
+  if (now - last_read < 5) return;
+  last_read = now;
+
+  float a = readAngle();
+  tilt_smooth += 0.25f * angleDiff(a, tilt_smooth);
+
+  if (!anyNoteSounding()) return;
+
+  float d = angleDiff(tilt_smooth, tilt_ref);
+  if (fabs(d) < bend_deadzone) d = 0;
+  else d -= (d > 0 ? bend_deadzone : -bend_deadzone);
+
+  bend = 8192 + (int)(d * 8192.0f / (bend_full - bend_deadzone));
+  bend = constrain(bend, 0, 16383);
+
+  bool moved = abs(bend - (int)last_bend) >= 16;
+  bool recentered = (bend == 8192 && last_bend != 8192);
+  if ((moved || recentered) && now - bend_time >= 10) {
+    sendPitchBend(bend);
+    Serial.println(tilt_smooth);
+    last_bend = bend;
+    bend_time = now;
+  }
+}
+
 void scanKeys() {
   uint32_t now = millis();
   for (uint8_t ch = 0; ch < 8; ch++) {
@@ -117,7 +203,8 @@ void scanKeys() {
       if (pressed) {
         int n = key_to_note_wickihaydn[key] + oct * 12;
         if (n >= 0 && n <= 127) {
-          sounding_note[k] = n;
+          if (!anyNoteSounding()) captureTiltRef();
+          sounding_note[k] = n;         
           sendNote(true, n, pressure);
         }
       } else if (sounding_note[k] != 255) {
@@ -184,20 +271,27 @@ void checkBoth(){
 
 void updateDisplay() {
   display.clearBuffer();
-  display.drawRBox(0, 0, 10, map(pressure, 0, 127, 4, SCREEN_HEIGHT), 2); // Pressure indicator
-  display.drawRBox(SCREEN_WIDTH - 10, 0, 10, map(mod, 0, 127, 4, SCREEN_HEIGHT), 2); // Mod indicator
-  display.setCursor(20, 30);
-  display.print("Oct");
-  display.setCursor(70, 30);
+  display.drawRBox(0, 0, SCREEN_WIDTH/3, map(pressure, 0, 127, 6, SCREEN_HEIGHT-14), 2); // Pressure indicator
+  display.drawRBox(85, 0, SCREEN_WIDTH/3, map(mod, 0, 127, 6, SCREEN_HEIGHT-14), 2); // Mod indicator
+
+  bend_ind = map(bend, 0, 16383, -SCREEN_HEIGHT+14, SCREEN_HEIGHT-14); // Bend indicator
+  bend_ind = abs(bend_ind);
+  if (bend_ind <= 6) bend_ind = 6;
+  bend_ind = constrain(bend_ind, 6, SCREEN_HEIGHT-14); 
+  display.drawRBox(43, 0, SCREEN_WIDTH/3-1, bend_ind, 2);
+
+  display.setCursor(0, 62);
+  display.print("Oct:");
+  display.setCursor(32, 62);
   display.print(oct);
-  display.setCursor(20, 62);
-  display.print("Ch");
-  display.setCursor(70, 62);
+  display.setCursor(64, 62);
+  display.print("Ch:");
+  display.setCursor(96, 62);
   display.print(midi_channel);
   if (ui == UI_OCT) {
-    display.drawLine(20, 31, 108, 31);
+    display.drawLine(0, 63, 64, 63);
   } else if (ui == UI_CH) {
-    display.drawLine(20, 63, 108, 63);
+    display.drawLine(64, 63, 128, 63);
   }
 
   // Only update the whole screen if it needs to
@@ -205,8 +299,7 @@ void updateDisplay() {
     display.sendBuffer();
     need_full = false;
   } else {
-    display.updateDisplayArea(0, 0, 2, 8);    // left bar: tiles 0-1, full height
-    display.updateDisplayArea(14, 0, 2, 8);   // right bar: tiles 14-15
+    display.updateDisplayArea(0, 0, 16, 7);    // left bar: tiles 0-1, full height
   }
 }
 
@@ -254,8 +347,16 @@ void setup() {
   // Check if pressure sensor is available and initialized
   if (!lps.begin()) {
     Serial.println("Failed to find LPS28 sensor!");
-    display.setCursor(20, 32);
-    display.print("NO SENSOR");
+    display.setCursor(20, 20);
+    display.print("NO LPS");
+    while (1) delay(10);
+  }
+
+  // Check if accelerometer is available
+  if (!acc.begin()) {
+    Serial.println("Failed to find ADXL345 sensor!");
+    display.setCursor(20, 35);
+    display.print("NO ADXL");
     while (1) delay(10);
   }
 
@@ -269,7 +370,18 @@ void setup() {
   Serial.print("LPS28 sensor found! Baseline: ");
   Serial.println(baseline);
 
-  
+  // Set range and data rate for accelerometer
+  acc.setRange(ADXL345_RANGE_2_G);
+  acc.setDataRate(ADXL345_DATARATE_100_HZ);
+
+  ax = acc.getX();
+  ay = acc.getY();
+  az = acc.getZ();
+
+  tilt_smooth = readAngle();
+
+  Serial.println("ADXL345 sensor found!");
+
   delay(500);
   Serial.println("Welcome to ISOFLUTE by Axel Henriksson");
 
@@ -284,6 +396,7 @@ void setup() {
   
   Serial.println("Commencing...");
   display.clear();
+  display.setFont(u8g2_font_t0_11_tf);
 }
 
 void loop() {
@@ -318,6 +431,8 @@ void loop() {
     } else sendModulation(0);
     last_mod = mod;
   }
+
+  updateTilt();
   
   // Key handling
   uint32_t now = millis(); // Get the current time in milliseconds
@@ -329,7 +444,7 @@ void loop() {
 
   // Update display
   uint32_t t = millis();
-  if (now - last_display_update_time >= 20){
+  if (now - last_display_update_time >= 40){
     last_display_update_time = t;
     updateDisplay();
   }
