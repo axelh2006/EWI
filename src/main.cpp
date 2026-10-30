@@ -271,28 +271,32 @@ void checkBoth(){
 
 void updateDisplay() {
   display.clearBuffer();
-  display.drawRBox(0, 0, SCREEN_WIDTH/3, map(pressure, 0, 127, 6, SCREEN_HEIGHT-14), 2); // Pressure indicator
-  display.drawRBox(85, 0, SCREEN_WIDTH/3, map(mod, 0, 127, 6, SCREEN_HEIGHT-14), 2); // Mod indicator
 
-  bend_ind = map(bend, 0, 16383, -SCREEN_HEIGHT+14, SCREEN_HEIGHT-14); // Bend indicator
-  bend_ind = abs(bend_ind);
-  if (bend_ind <= 6) bend_ind = 6;
-  bend_ind = constrain(bend_ind, 6, SCREEN_HEIGHT-14); 
-  display.drawRBox(43, 0, SCREEN_WIDTH/3-1, bend_ind, 2);
-
-  display.setCursor(0, 62);
-  display.print("Oct:");
-  display.setCursor(32, 62);
-  display.print(oct);
-  display.setCursor(64, 62);
-  display.print("Ch:");
-  display.setCursor(96, 62);
-  display.print(midi_channel);
-  if (ui == UI_OCT) {
-    display.drawLine(0, 63, 64, 63);
-  } else if (ui == UI_CH) {
-    display.drawLine(64, 63, 128, 63);
+  for (int i = 0; i < 7; i++) {
+    display.drawCircle(i*15+19, 58, 4);
   }
+
+  display.drawDisc((oct)*15+65, 58, 4);
+
+  if (ui == UI_CH) {
+    display.setCursor(0, 14);
+    display.print("Ch:");
+    display.setCursor(30, 14);
+    display.print(midi_channel);
+  }
+
+  // New test UI
+
+  int dotsize = map(pressure, 0, 127, 2, 15);
+  int doty = map(bend, 0, 16383, 10, 54);
+
+  uint32_t now = millis();
+  int sin = map(sinf(now*0.01), 0, 1, 10, 118);
+
+  int dotx = SCREEN_WIDTH / 2 + (int)(map(mod, 0, 127, 0, 20) * sinf(millis() / 50.0f));
+
+  if (anyNoteSounding()) display.drawDisc(dotx, doty, dotsize);
+  else display.drawCircle(dotx, doty, dotsize);
 
   // Only update the whole screen if it needs to
   if (need_full) {
@@ -396,7 +400,7 @@ void setup() {
   
   Serial.println("Commencing...");
   display.clear();
-  display.setFont(u8g2_font_t0_11_tf);
+  display.setFont(u8g2_font_pxplusibmvga8_mf);
 }
 
 void loop() {
