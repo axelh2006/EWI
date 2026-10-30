@@ -42,10 +42,10 @@ uint32_t last_change[32]; // Array to store the last change time of each button 
 Adafruit_LPS28 lps; // Create an instance of the LPS28 pressure sensor
 float baseline;
 uint8_t pressure; // Variable to store the pressure reading
-uint8_t pressure_tresh = 2;
+uint8_t pressure_tresh = 1;
 float rest;
 const float pressure_deadzone_hpa = 1.2f;
-const float pressure_range_hpa = 12.0f;
+const float pressure_range_hpa = 11.0f;
 
 Adafruit_ADXL345_Unified acc = Adafruit_ADXL345_Unified();
 
@@ -121,14 +121,14 @@ void releaseAll() {
 }
 
 void sendPitchBend(int16_t value) { // Pitch Bend, 0 - 16383, 8192 = centre
-  value = constrain(value, 0, 16383);
+  value = map(constrain(value, 0, 16383), 0, 16383, 16383, 0);
   // HID
   uint8_t msg[3] = { (uint8_t)(0xE0 | ((midi_channel - 1) & 0x0F)),
                      (uint8_t)(value & 0x7F),
                      (uint8_t)(value >> 7) };
   Serial1.write(msg, 3);
   // USB
-  usb_midi.pitchBend(-((float)value - 8192.0f) / 8192.0f, midi_channel);
+  usb_midi.pitchBend(((float)value - 8192.0f) / 8192.0f, midi_channel);
 }
 
 void captureTiltRef() {
@@ -157,7 +157,7 @@ float angleDiff(float current, float reference) {
 void updateTilt() {
   static uint32_t last_read = 0;
   uint32_t now = millis();
-  if (now - last_read < 5) return;
+  if (now - last_read < 10) return;
   last_read = now;
 
   float a = readAngle();
@@ -176,7 +176,6 @@ void updateTilt() {
   bool recentered = (bend == 8192 && last_bend != 8192);
   if ((moved || recentered) && now - bend_time >= 10) {
     sendPitchBend(bend);
-    Serial.println(tilt_smooth);
     last_bend = bend;
     bend_time = now;
   }
@@ -279,31 +278,30 @@ void updateDisplay() {
   display.drawDisc((oct)*15+65, 58, 4);
 
   if (ui == UI_CH) {
-    display.setCursor(0, 14);
+    display.drawRFrame(37, 24, 54, 18, 2);
+    display.setCursor(41, 38);
     display.print("Ch:");
-    display.setCursor(30, 14);
+    display.setCursor(72, 38);
     display.print(midi_channel);
+  } else {
+    int dotsize = map(pressure, 0, 127, 2, 15);
+    int doty = map(bend, 0, 16383, 54, 10);
+
+    uint32_t now = millis();
+    int sin = map(sinf(now*0.01), 0, 1, 10, 118);
+
+    int dotx = SCREEN_WIDTH / 2 + (int)(map(mod, 0, 127, 0, 10) * sinf(millis() / 35.0f));
+
+    if (anyNoteSounding()) display.drawDisc(dotx, doty, dotsize);
+    else display.drawCircle(dotx, doty, dotsize);
   }
-
-  // New test UI
-
-  int dotsize = map(pressure, 0, 127, 2, 15);
-  int doty = map(bend, 0, 16383, 10, 54);
-
-  uint32_t now = millis();
-  int sin = map(sinf(now*0.01), 0, 1, 10, 118);
-
-  int dotx = SCREEN_WIDTH / 2 + (int)(map(mod, 0, 127, 0, 20) * sinf(millis() / 50.0f));
-
-  if (anyNoteSounding()) display.drawDisc(dotx, doty, dotsize);
-  else display.drawCircle(dotx, doty, dotsize);
 
   // Only update the whole screen if it needs to
   if (need_full) {
     display.sendBuffer();
     need_full = false;
   } else {
-    display.updateDisplayArea(0, 0, 16, 7);    // left bar: tiles 0-1, full height
+    display.updateDisplayArea(4, 0, 8, 7);
   }
 }
 
@@ -378,11 +376,11 @@ void setup() {
   acc.setRange(ADXL345_RANGE_2_G);
   acc.setDataRate(ADXL345_DATARATE_100_HZ);
 
-  ax = acc.getX();
-  ay = acc.getY();
-  az = acc.getZ();
+  //ax = acc.getX();
+  //ay = acc.getY();
+  //az = acc.getZ();
 
-  tilt_smooth = readAngle();
+  //tilt_smooth = readAngle();
 
   Serial.println("ADXL345 sensor found!");
 
