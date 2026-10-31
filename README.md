@@ -7,7 +7,7 @@
 * Sends pitch bend based on tilt
 * Works with both USB MIDI and TRS MIDI (Type A)
 * Buttons for changing octave, MIDI channel and setting pressure baseline
-* Simple UI that shows all parameters
+* Simple UI that shows all parameters, and settings for pressure/aftertouch and velocity which are written to flash memory.
 * 3D-printed enclosure and keycaps
 
 ## Parts used
