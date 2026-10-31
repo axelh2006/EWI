@@ -8,6 +8,7 @@
 // Libraries
 #include <Arduino.h>
 #include <USB.h>
+#include <Preferences.h>
 #include <USBMIDI.h>
 #include <Button2.h>
 #include <Adafruit_LPS28.h>
@@ -27,6 +28,8 @@
 #define TOUCH_PIN 6
 
 Button2 btnB, btnA;
+
+bool both = false;
 
 // Mux definitions
 const uint8_t sel[3] = { 36, 37, 38}; // Pins for the 3-bit binary address of the multiplexer
@@ -63,6 +66,9 @@ float az = 0.0;
 float tilt = 0.0;
 int bend = 0;
 
+bool sendPressure = true;
+bool sendVel = true;
+
 uint8_t  last_pressure_sent = 255;      // 255 forces the first send
 uint32_t last_pressure_time = 0;
 
@@ -80,14 +86,44 @@ USBMIDI usb_midi; // Create a USBMIDI object for USB MIDI communication
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C display(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
 uint32_t last_display_update_time = 0;
 
+// Preference saving globals
+Preferences prefs;
+bool prefs_dirty = false;
+uint32_t prefs_changed = 0;
+
 // UI globals
-enum uiState : uint8_t {UI_OCT, UI_CH};
+enum uiState : uint8_t {UI_OCT, UI_CH, UI_SENDPRS, UI_SENDVEL};
 uiState ui = UI_OCT;
-const uint8_t ui_items = 2;
+const uint8_t ui_items = 4;
 const uint16_t long_press = 300; // Milliseconds
 bool need_full = true;
 int bend_ind = 6;
 uint8_t shown_pressure = 255; int shown_bend = -1; bool shown_sounding = false;
+bool reset_active = false;
+bool reset_drawn = false;
+uint32_t reset_start = 0;
+
+
+void loadSettings() {
+  prefs.begin("isoflute", false);
+  oct = constrain((int)prefs.getChar("oct", 0), (int)oct_min, (int)oct_max);
+  midi_channel = constrain((int)prefs.getChar("ch", 1), 1, 16);
+  sendPressure = prefs.getBool("prs", false);
+  sendVel = prefs.getBool("vel", false);
+}
+
+void saveSettings() {
+  prefs.putChar("oct", oct);
+  prefs.putChar("ch", midi_channel);
+  prefs.putBool("prs", sendPressure);
+  prefs.putBool("vel", sendVel);
+  prefs_dirty = false;
+}
+
+void markSettingsDirty() {
+  prefs_dirty = true;
+  prefs_changed = millis();
+}
 
 bool anyNoteSounding() {
   for (uint8_t k = 0; k < 32; k++) if (sounding_note[k] != 255) return true;
@@ -95,7 +131,9 @@ bool anyNoteSounding() {
 }
 
 void sendNote(bool on, uint8_t note, uint8_t vel) {
-  vel = constrain(vel, 1, 127);
+  if (sendVel) vel = constrain(vel, 1, 127);
+  else vel = 64;
+
   // DIN
   uint8_t status = (on ? 0x90 : 0x80) | ((midi_channel - 1) & 0x0F); // Note on/off message
   uint8_t velmsg = on ? vel : 0;
@@ -215,14 +253,17 @@ void scanKeys() {
 
 void sendChannelPressure(uint8_t value) {
   // HID
-  uint8_t msg[2] = { (uint8_t)(0xD0 | ((midi_channel - 1) & 0x0F)), value }; 
-  Serial1.write(msg, 2);
-  uint8_t msg1[3] = { (uint8_t)(0xB0 | ((midi_channel - 1) & 0x0F)), 2, value };
-  Serial1.write(msg1, 3);
+  if (!sendPressure) {
+    uint8_t msg[2] = { (uint8_t)(0xD0 | ((midi_channel - 1) & 0x0F)), value }; 
+    Serial1.write(msg, 2);
 
-  // USB
-  usb_midi.channelPressure(value, midi_channel);
-  usb_midi.controlChange(2, value, midi_channel);
+    usb_midi.channelPressure(value, midi_channel);
+  } else {
+    uint8_t msg1[3] = { (uint8_t)(0xB0 | ((midi_channel - 1) & 0x0F)), 2, value };
+    Serial1.write(msg1, 3);
+
+    usb_midi.controlChange(2, value, midi_channel);  
+  }
 }
 
 void sendModulation(uint8_t value) {
@@ -236,18 +277,22 @@ void sendModulation(uint8_t value) {
 
 void changeOctave(int8_t delta) {
   oct = constrain((int)oct + delta, (int)oct_min, (int)oct_max);
+  markSettingsDirty();
 }
 
 void changeChannel(int8_t delta) {
   sendChannelPressure(0);
   midi_channel = ((midi_channel - 1 + delta + 16) % 16) + 1;
   last_pressure_sent = 255;
+  markSettingsDirty();
 }
 
 void onA(Button2&) {
   switch(ui) {
     case UI_OCT: changeOctave(-1); need_full = true; break;
     case UI_CH: changeChannel(-1); need_full = true; break;
+    case UI_SENDPRS: sendPressure = true; need_full = true; markSettingsDirty(); break;
+    case UI_SENDVEL: sendVel = false; need_full = true; markSettingsDirty(); break;
   }
 }
 
@@ -258,13 +303,30 @@ void onBReleased(Button2& b) {
       if (isLong) ui = UI_CH; else changeOctave(+1); need_full = true;
       break;
     case UI_CH: 
-      if (isLong) ui = UI_OCT; else changeChannel(+1); need_full = true;
+      if (isLong) ui = UI_SENDPRS; else changeChannel(+1); need_full = true;
+      break;
+    case UI_SENDPRS:
+      if (isLong) ui = UI_SENDVEL; else sendPressure = false; need_full = true;
+      markSettingsDirty();
+      break;
+    case UI_SENDVEL:
+      if (isLong) ui = UI_OCT; else sendVel = true; need_full = true;
+      markSettingsDirty();
       break;
   }
 }
 
 void checkBoth(){
-  if (btnA.isPressed() && btnB.isPressed()) rest = lps.getPressure();
+  bool a = btnA.isPressed(), b = btnB.isPressed();
+  if ( a && b && !both) {
+    both = true;
+    rest = lps.getPressure();
+    reset_active = true;
+    reset_drawn = false;
+    reset_start = millis();
+  } else if ( !a && !b) {
+    both = false;
+  }
 }
 
 void updateDisplay() {
@@ -276,12 +338,45 @@ void updateDisplay() {
 
   display.drawDisc((oct)*15+65, 58, 4);
 
+  if (reset_active) {
+    if (millis() - reset_start < 1000) {
+      if (!reset_drawn) {
+        display.clearBuffer();
+        
+        display.drawRFrame(37, 24, 54, 18, 2);
+        display.setCursor(44, 38);
+        display.print("RESET");
+
+        display.sendBuffer();
+        reset_drawn = true;
+      }
+      return;
+    }
+    reset_active = false;
+    reset_drawn = false;
+    need_full = true;
+  }
+
   if (ui == UI_CH) {
     display.drawRFrame(37, 24, 54, 18, 2);
     display.setCursor(41, 38);
     display.print("Ch:");
     display.setCursor(72, 38);
     display.print(midi_channel);
+  } else if (ui == UI_SENDPRS) {
+    display.drawRFrame(31, 24, 66, 18, 2);
+    display.setCursor(35, 38);
+    display.print("Send");
+    display.setCursor(70, 38);
+    if (sendPressure) display.print("PRS");
+    else if (!sendPressure) display.print("AFT");
+  } else if (ui == UI_SENDVEL) {
+    display.drawRFrame(31, 24, 66, 18, 2);
+    display.setCursor(35, 38);
+    display.print("Vel");
+    display.setCursor(70, 38);
+    if (sendVel) display.print("YES");
+    else if (!sendVel) display.print("NO");
   } else {
     int dotsize = map(pressure, 0, 127, 2, 15);
     int doty = map(bend, 0, 16383, 54, 10);
@@ -309,8 +404,10 @@ void setup() {
   USB.manufacturerName("Axel Henriksson");
   USB.begin(); // Initialize USB communication   
   usb_midi.begin(); // Initialize USB MIDI communication
-  Serial.begin(9600); // Initialize serial communication for debugging
+  Serial.begin(115200); // Initialize serial communication for debugging
   Serial1.begin(31250, SERIAL_8N1, MIDI_RX, MIDI_TX); // Initialize MIDI communication at 31250 baud rate
+
+  loadSettings();
 
   // Initialize buttons
   btnA.begin(BUTTONA_PIN);
@@ -452,11 +549,14 @@ void loop() {
   // Update display
   uint32_t t = millis();
   bool sounding = anyNoteSounding();
-  bool dirty = need_full || mod > 5 || pressure != shown_pressure || bend != shown_bend || sounding != shown_sounding;
+  bool dirty = need_full || mod > 5 || pressure != shown_pressure || bend != shown_bend || sounding != shown_sounding || reset_active;
   if (dirty && t - last_display_update_time >= 40) {
     last_display_update_time = t;
     shown_pressure = pressure; shown_bend = bend; shown_sounding = sounding;
     updateDisplay();
   }
+
+  // Save settings
+  if (prefs_dirty && millis() - prefs_changed > 2000 && !anyNoteSounding()) saveSettings();
 }
 
