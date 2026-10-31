@@ -1,7 +1,7 @@
 # ISOFLUTE by Axel Henriksson
 **A MIDI controller EWI with an isomorphic keyboard based on ESP32-S3 and the arduinoesp32 framework**
 ## Features
-* 28 Keys
+* 28 Keys arranged in 4 rows of 7 keys, using the Wicki-Hayden layout
 * Sends MIDI pressure CC and aftertouch based on air pressure sensor readings
 * Pressure sensor pad for MIDI modulation
 * Sends pitch bend based on tilt
