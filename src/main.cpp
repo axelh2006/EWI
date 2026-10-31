@@ -43,11 +43,16 @@ bool last[32]; // Array to store the last state of each button for debouncing
 uint32_t last_change[32]; // Array to store the last change time of each button for debouncing
 
 Adafruit_LPS28 lps; // Create an instance of the LPS28 pressure sensor
+uint8_t pressure_lin;
 uint8_t pressure; // Variable to store the pressure reading
-uint8_t pressure_tresh = 1;
+uint8_t pressure_tresh;
 float rest;
-const float pressure_deadzone_hpa = 1.2f;
-const float pressure_range_hpa = 11.0f;
+float pressure_deadzone_hpa = 1.2f;
+float pressure_range_hpa;
+
+enum BreathCurve : uint8_t { LINEAR, SOFT, HARD, S_CURVE, COUNT };
+const char* curve_names[COUNT] = { "Linear", "Soft", "Hard", "S-curve" };
+uint8_t breath_curve = LINEAR;
 
 Adafruit_ADXL345_Unified acc = Adafruit_ADXL345_Unified();
 
@@ -59,15 +64,14 @@ float tilt_smooth = 0;
 uint16_t last_bend = 8192;
 uint32_t bend_time = 0;
 
-float ax = 0.0;
 float ay = 0.0;
 float az = 0.0;
 
 float tilt = 0.0;
-int bend = 0;
+int bend = 8192;
 
-bool sendPressure = true;
-bool sendVel = true;
+bool sendPressure;
+bool sendVel;
 
 uint8_t  last_pressure_sent = 255;      // 255 forces the first send
 uint32_t last_pressure_time = 0;
@@ -92,12 +96,10 @@ bool prefs_dirty = false;
 uint32_t prefs_changed = 0;
 
 // UI globals
-enum uiState : uint8_t {UI_OCT, UI_CH, UI_SENDPRS, UI_SENDVEL};
+enum uiState : uint8_t {UI_OCT, UI_SENS, UI_TRESH, UI_CURVE, UI_CH, UI_SENDPRS, UI_SENDVEL};
 uiState ui = UI_OCT;
-const uint8_t ui_items = 4;
 const uint16_t long_press = 300; // Milliseconds
 bool need_full = true;
-int bend_ind = 6;
 uint8_t shown_pressure = 255; int shown_bend = -1; bool shown_sounding = false;
 bool reset_active = false;
 bool reset_drawn = false;
@@ -107,6 +109,9 @@ uint32_t reset_start = 0;
 void loadSettings() {
   prefs.begin("isoflute", false);
   oct = constrain((int)prefs.getChar("oct", 0), (int)oct_min, (int)oct_max);
+  pressure_range_hpa = constrain((int)prefs.getChar("range", 10), 1, 20);
+  pressure_tresh = constrain((int)prefs.getChar("treshf", 1), 1, 20);
+  breath_curve = constrain((int)prefs.getChar("curve", 0), 0, 3);
   midi_channel = constrain((int)prefs.getChar("ch", 1), 1, 16);
   sendPressure = prefs.getBool("prs", false);
   sendVel = prefs.getBool("vel", false);
@@ -114,6 +119,9 @@ void loadSettings() {
 
 void saveSettings() {
   prefs.putChar("oct", oct);
+  prefs.putChar("range", pressure_range_hpa);
+  prefs.putChar("treshf", pressure_tresh);
+  prefs.putChar("curve", breath_curve);
   prefs.putChar("ch", midi_channel);
   prefs.putBool("prs", sendPressure);
   prefs.putBool("vel", sendVel);
@@ -123,6 +131,16 @@ void saveSettings() {
 void markSettingsDirty() {
   prefs_dirty = true;
   prefs_changed = millis();
+}
+
+float applyCurve(float x) {
+  x = constrain(x, 0.0f, 1.0f);
+  switch (breath_curve) {
+    case SOFT: return x * x;
+    case HARD: return sqrtf(x);
+    case S_CURVE: return x * x * (3.0f - 2.0f * x);
+    default: return x;
+  }
 }
 
 bool anyNoteSounding() {
@@ -200,7 +218,7 @@ void updateTilt() {
   float a = readAngle();
   tilt_smooth += 0.25f * angleDiff(a, tilt_smooth);
 
-  if (!anyNoteSounding()) return;
+  if (!anyNoteSounding()) { bend = 8192; return; }
 
   float d = angleDiff(tilt_smooth, tilt_ref);
   if (fabs(d) < bend_deadzone) d = 0;
@@ -281,15 +299,34 @@ void changeOctave(int8_t delta) {
 }
 
 void changeChannel(int8_t delta) {
+  releaseAll();
   sendChannelPressure(0);
   midi_channel = ((midi_channel - 1 + delta + 16) % 16) + 1;
   last_pressure_sent = 255;
   markSettingsDirty();
 }
 
+void changeCurve(int8_t delta) {
+  breath_curve = (breath_curve + delta + COUNT) % COUNT;
+  markSettingsDirty();
+}
+
 void onA(Button2&) {
   switch(ui) {
     case UI_OCT: changeOctave(-1); need_full = true; break;
+    case UI_SENS: 
+      pressure_range_hpa--; 
+      if (pressure_range_hpa < 1) pressure_range_hpa = 1;
+      need_full = true; 
+      markSettingsDirty(); 
+      break;
+    case UI_TRESH: 
+      pressure_tresh--; 
+      if (pressure_tresh < 1) pressure_tresh = 1;
+      need_full = true;
+      markSettingsDirty(); 
+      break;
+    case UI_CURVE: changeCurve(-1); need_full = true; break;
     case UI_CH: changeChannel(-1); need_full = true; break;
     case UI_SENDPRS: sendPressure = true; need_full = true; markSettingsDirty(); break;
     case UI_SENDVEL: sendVel = false; need_full = true; markSettingsDirty(); break;
@@ -300,7 +337,26 @@ void onBReleased(Button2& b) {
   bool isLong = b.wasPressedFor() >= long_press;
   switch(ui) {
     case UI_OCT: 
-      if (isLong) ui = UI_CH; else changeOctave(+1); need_full = true;
+      if (isLong) ui = UI_SENS; else changeOctave(+1); need_full = true;
+      break;
+    case UI_SENS:
+      if (isLong) ui = UI_TRESH; else {
+        pressure_range_hpa++;
+        if (pressure_range_hpa > 20) pressure_range_hpa = 20;              
+      }
+      markSettingsDirty();
+      need_full = true;
+      break;
+    case UI_TRESH:
+      if (isLong) ui = UI_CURVE; else {
+        pressure_tresh++;
+        if (pressure_tresh > 20) pressure_tresh = 20;        
+      }
+      markSettingsDirty();
+      need_full = true;
+      break;
+    case UI_CURVE:
+      if (isLong) ui = UI_CH; else changeCurve(+1); need_full = true;
       break;
     case UI_CH: 
       if (isLong) ui = UI_SENDPRS; else changeChannel(+1); need_full = true;
@@ -324,19 +380,14 @@ void checkBoth(){
     reset_active = true;
     reset_drawn = false;
     reset_start = millis();
+    ui = UI_OCT;
   } else if ( !a && !b) {
     both = false;
   }
 }
 
 void updateDisplay() {
-  display.clearBuffer();
-
-  for (int i = 0; i < 7; i++) {
-    display.drawCircle(i*15+19, 58, 4);
-  }
-
-  display.drawDisc((oct)*15+65, 58, 4);
+  display.clearBuffer();  
 
   if (reset_active) {
     if (millis() - reset_start < 1000) {
@@ -357,36 +408,65 @@ void updateDisplay() {
     need_full = true;
   }
 
-  if (ui == UI_CH) {
-    display.drawRFrame(37, 24, 54, 18, 2);
-    display.setCursor(41, 38);
-    display.print("Ch:");
-    display.setCursor(72, 38);
-    display.print(midi_channel);
-  } else if (ui == UI_SENDPRS) {
-    display.drawRFrame(31, 24, 66, 18, 2);
-    display.setCursor(35, 38);
-    display.print("Send");
-    display.setCursor(70, 38);
-    if (sendPressure) display.print("PRS");
-    else if (!sendPressure) display.print("AFT");
-  } else if (ui == UI_SENDVEL) {
-    display.drawRFrame(31, 24, 66, 18, 2);
-    display.setCursor(35, 38);
-    display.print("Vel");
-    display.setCursor(70, 38);
-    if (sendVel) display.print("YES");
-    else if (!sendVel) display.print("NO");
-  } else {
-    int dotsize = map(pressure, 0, 127, 2, 15);
-    int doty = map(bend, 0, 16383, 54, 10);
+  // Menu handling
+  switch (ui) {      
+    case UI_SENS:
+      display.drawRFrame(28, 24, 72, 18, 2);
+      display.setCursor(32, 38);
+      display.print("RANGE:");
+      display.setCursor(81, 38);
+      display.print(pressure_range_hpa, 0);
+      break;
+    case UI_TRESH:
+      display.drawRFrame(24, 24, 80, 18, 2);
+      display.setCursor(28, 38);
+      display.print("TRESH:");
+      display.setCursor(77, 38);
+      display.print(pressure_tresh, 1);
+      break;
+    case UI_CURVE:
+      display.drawRFrame(4, 24, 120, 18, 2);
+      display.setCursor(11, 38);
+      display.print("CURVE:");
+      display.setCursor(60, 38);
+      display.print(curve_names[breath_curve]);
+      break;
+    case UI_CH:
+      display.drawRFrame(37, 24, 50, 18, 2);
+      display.setCursor(41, 38);
+      display.print("CH:");
+      display.setCursor(68, 38);
+      display.print(midi_channel);
+      break;
+    case UI_SENDPRS:
+      display.drawRFrame(31, 24, 66, 18, 2);
+      display.setCursor(35, 38);
+      display.print("SEND");
+      display.setCursor(70, 38);
+      if (sendPressure) display.print("PRS");
+      else if (!sendPressure) display.print("AFT");
+      break;
+    case UI_SENDVEL:
+      display.drawRFrame(31, 24, 66, 18, 2);
+      display.setCursor(35, 38);
+      display.print("VEL:");
+      display.setCursor(70, 38);
+      if (sendVel) display.print("YES");
+      else if (!sendVel) display.print("NO");
+      break;
+    default:
+      for (int i = 0; i < 7; i++) {
+        display.drawCircle(i*15+19, 58, 4);
+      }
+      display.drawDisc((oct)*15+65, 58, 4);
 
-    uint32_t now = millis();
-
-    int dotx = SCREEN_WIDTH / 2 + (int)(map(mod, 0, 127, 0, 10) * sinf(millis() / 35.0f));
-
-    if (anyNoteSounding()) display.drawDisc(dotx, doty, dotsize);
-    else display.drawCircle(dotx, doty, dotsize);
+      int dotsize = map(pressure, 0, 127, 2, 15);
+      int doty = map(bend, 0, 16383, 54, 10);
+      uint32_t now = millis();
+      int dotx = SCREEN_WIDTH / 2 + (int)(map(mod, 0, 127, 0, 10) * sinf(millis() / 35.0f));
+      if (anyNoteSounding()) display.drawDisc(dotx, doty, dotsize);
+      else display.drawCircle(dotx, doty, dotsize);
+      break;
   }
 
   // Only update the whole screen if it needs to
@@ -425,8 +505,6 @@ void setup() {
   
   Serial.println("Starting...");
 
-  
-
   // Check if the display is availabe and initialized
   if (!display.begin()) {
     Serial.println("Display initialization failed");
@@ -446,6 +524,7 @@ void setup() {
     Serial.println("Failed to find LPS28 sensor!");
     display.setCursor(20, 20);
     display.print("NO LPS");
+    display.sendBuffer();
     while (1) delay(10);
   }
 
@@ -454,6 +533,7 @@ void setup() {
     Serial.println("Failed to find ADXL345 sensor!");
     display.setCursor(20, 35);
     display.print("NO ADXL");
+    display.sendBuffer();
     while (1) delay(10);
   }
 
@@ -517,7 +597,8 @@ void loop() {
     }
 
     float x = (p - rest - pressure_deadzone_hpa) / pressure_range_hpa;
-    pressure = (uint8_t)constrain((int)(x * 127.0f), 0, 127);
+    pressure_lin = (uint8_t)constrain((int)(x * 127.0f), 0, 127);
+    pressure = (uint8_t)constrain((int)(applyCurve(x) * 127.0f + 0.5f), 0, 127);
 
     uint32_t now = millis();
     if (pressure != last_pressure_sent && now - last_pressure_time >= 10) {
@@ -540,7 +621,7 @@ void loop() {
   
   // Key handling
   uint32_t now = millis(); // Get the current time in milliseconds
-  if (pressure > pressure_tresh) { // If pressure is below threshold, skip processing
+  if (pressure_lin > pressure_tresh) { // If pressure is below threshold, skip processing
     scanKeys();
   } else {
     releaseAll();
