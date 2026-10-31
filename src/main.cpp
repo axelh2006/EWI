@@ -40,7 +40,6 @@ bool last[32]; // Array to store the last state of each button for debouncing
 uint32_t last_change[32]; // Array to store the last change time of each button for debouncing
 
 Adafruit_LPS28 lps; // Create an instance of the LPS28 pressure sensor
-float baseline;
 uint8_t pressure; // Variable to store the pressure reading
 uint8_t pressure_tresh = 1;
 float rest;
@@ -88,6 +87,7 @@ const uint8_t ui_items = 2;
 const uint16_t long_press = 300; // Milliseconds
 bool need_full = true;
 int bend_ind = 6;
+uint8_t shown_pressure = 255; int shown_bend = -1; bool shown_sounding = false;
 
 bool anyNoteSounding() {
   for (uint8_t k = 0; k < 32; k++) if (sounding_note[k] != 255) return true;
@@ -138,11 +138,10 @@ void captureTiltRef() {
 }
 
 float readAngle() {
-  ax = acc.getX();
   ay = acc.getY();
   az = acc.getZ();
 
-  tilt = atan2(ay, az) * 180.0 / PI;
+  tilt = atan2f(ay, az) * 57.29578f;
 
   return tilt;
 }
@@ -288,7 +287,6 @@ void updateDisplay() {
     int doty = map(bend, 0, 16383, 54, 10);
 
     uint32_t now = millis();
-    int sin = map(sinf(now*0.01), 0, 1, 10, 118);
 
     int dotx = SCREEN_WIDTH / 2 + (int)(map(mod, 0, 127, 0, 10) * sinf(millis() / 35.0f));
 
@@ -301,7 +299,7 @@ void updateDisplay() {
     display.sendBuffer();
     need_full = false;
   } else {
-    display.updateDisplayArea(4, 0, 8, 7);
+    display.updateDisplayArea(4, 0, 8, 8);
   }
 }
 
@@ -369,8 +367,7 @@ void setup() {
   delay(100);
   rest = lps.getPressure();
 
-  Serial.print("LPS28 sensor found! Baseline: ");
-  Serial.println(baseline);
+  Serial.print("LPS28 sensor found!");
 
   // Set range and data rate for accelerometer
   acc.setRange(ADXL345_RANGE_2_G);
@@ -409,7 +406,19 @@ void loop() {
   // Pressure handling
   if (lps.getStatus() & LPS28_STATUS_PRESS_READY) { // Pressure data available
     float p = lps.getPressure();
-    if (p - rest < pressure_deadzone_hpa) rest += 0.02f * (p - rest);
+    uint32_t t_now = millis();
+
+    static uint32_t below_since = 0;
+    float diff = p - rest;
+    if (diff < -0.5f) {
+    // a dip below rest: don't follow it, unless it lasts long enough to be a real change in ambient pressure
+      if (below_since == 0) below_since = t_now;
+      if (t_now - below_since > 10000) { rest = p; below_since = 0; }
+    } else {
+      below_since = 0;
+      if (diff < pressure_deadzone_hpa) rest += 0.003f * diff;    // time constant about 1.7 s
+    }
+
     float x = (p - rest - pressure_deadzone_hpa) / pressure_range_hpa;
     pressure = (uint8_t)constrain((int)(x * 127.0f), 0, 127);
 
@@ -422,15 +431,11 @@ void loop() {
   }
 
   // Modulation pad handling
-  mod = map((analogRead(TOUCH_PIN)), 0, 4096, 0, 127);
-  //Serial.println(analogRead(TOUCH_PIN));
-  //Serial.println(mod);
-  if (mod <= 50) mod = 50;
-  mod = constrain(map(mod, 50, 127, 0, 127), 0, 127);
-  if (mod != last_mod) {
-    if (mod > 5) {
-      sendModulation(mod);      
-    } else sendModulation(0);
+  static float mod_f = 0;
+  mod_f += 0.2f * (analogRead(TOUCH_PIN) - mod_f);
+  mod = constrain(map((int)(mod_f * 127 / 4095), 50, 127, 0, 127), 0, 127);
+  if (abs((int)mod - (int)last_mod) >= 2 || (mod == 0 && last_mod != 0)) {
+    sendModulation(mod > 5 ? mod : 0);
     last_mod = mod;
   }
 
@@ -446,10 +451,12 @@ void loop() {
 
   // Update display
   uint32_t t = millis();
-  if (now - last_display_update_time >= 40){
+  bool sounding = anyNoteSounding();
+  bool dirty = need_full || mod > 5 || pressure != shown_pressure || bend != shown_bend || sounding != shown_sounding;
+  if (dirty && t - last_display_update_time >= 40) {
     last_display_update_time = t;
+    shown_pressure = pressure; shown_bend = bend; shown_sounding = sounding;
     updateDisplay();
   }
-
 }
 
