@@ -49,6 +49,9 @@ uint8_t pressure_tresh;
 float rest;
 float pressure_deadzone_hpa = 1.2f;
 float pressure_range_hpa;
+float breath_s = 0;
+float attack_ms = 8.0f;
+float release_ms = 40.0f;
 
 enum BreathCurve : uint8_t { LINEAR, SOFT, HARD, S_CURVE, COUNT };
 const char* curve_names[COUNT] = { "Linear", "Soft", "Hard", "S-curve" };
@@ -131,6 +134,17 @@ void saveSettings() {
 void markSettingsDirty() {
   prefs_dirty = true;
   prefs_changed = millis();
+}
+
+float smoothBreath(float x) {
+  static uint32_t last_us = 0;
+  uint32_t now_us = micros();
+  float dt = last_us ? (now_us - last_us) / 1000.0f : 5.0f; // Milliseconds
+  last_us = now_us;
+
+  float tau = (x > breath_s) ? attack_ms : release_ms;
+  breath_s += (1.0f - expf(-dt / tau)) * (x - breath_s);
+  return breath_s;
 }
 
 float applyCurve(float x) {
@@ -597,8 +611,10 @@ void loop() {
     }
 
     float x = (p - rest - pressure_deadzone_hpa) / pressure_range_hpa;
+    float xs = smoothBreath(x);
+
     pressure_lin = (uint8_t)constrain((int)(x * 127.0f), 0, 127);
-    pressure = (uint8_t)constrain((int)(applyCurve(x) * 127.0f + 0.5f), 0, 127);
+    pressure = (uint8_t)constrain((int)(applyCurve(xs) * 127.0f + 0.5f), 0, 127);
 
     uint32_t now = millis();
     if (pressure != last_pressure_sent && now - last_pressure_time >= 10) {
