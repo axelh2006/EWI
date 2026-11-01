@@ -15,6 +15,7 @@
 #include <Adafruit_ADXL345_U.h>
 #include <U8g2lib.h>
 #include <mappings.h>
+#include <saver_anim.h>
 
 // Screen definitions
 #define SCREEN_WIDTH 128
@@ -99,8 +100,16 @@ bool prefs_dirty = false;
 uint32_t prefs_changed = 0;
 
 // UI globals
-enum uiState : uint8_t {UI_OCT, UI_SENS, UI_TRESH, UI_CURVE, UI_CH, UI_SENDPRS, UI_SENDVEL};
-uiState ui = UI_OCT;
+enum uiState : uint8_t { UI_PLAY, UI_MENU, UI_EDIT };
+uiState ui = UI_PLAY;
+
+const int menu_items = 6;
+const int menu_rows = 4;
+const char* menu_names[menu_items] = { "RANGE", "TRESH", "CURVE", "CHAN", "SEND", "VEL" };
+uint8_t menu_sel = 0, menu_top = 0;
+
+bool menuIsToggle(uint8_t i) { return i >= 4; }
+
 const uint16_t long_press = 300; // Milliseconds
 bool need_full = true;
 uint8_t shown_pressure = 255; int shown_bend = -1; bool shown_sounding = false;
@@ -108,6 +117,47 @@ bool reset_active = false;
 bool reset_drawn = false;
 uint32_t reset_start = 0;
 
+enum SaverState : uint8_t { SV_AWAKE, SV_ANIM, SV_BLANK };
+SaverState saver = SV_AWAKE;
+const uint32_t saver_anim_ms = 60000;
+const uint32_t saver_off_ms = 300000;
+uint32_t last_activity = 0;
+bool swallow_next = false;
+
+bool anyNoteSounding() {
+  for (uint8_t k = 0; k < 32; k++) if (sounding_note[k] != 255) return true;
+  return false;
+}
+
+void setSaver(SaverState s) {
+  if (s == saver) return;
+  saver = s;
+  if (s == SV_BLANK) { display.clear(); display.setPowerSave(1); }
+  else display.setPowerSave(0);
+  if (s != SV_AWAKE) ui = UI_PLAY;
+  else need_full = true;
+}
+
+void drawSaver() {
+  static uint8_t frame = 0;
+  display.clearBuffer();
+  display.drawXBM(0, 0, SAVER_ANIM_WIDTH, SAVER_ANIM_HEIGHT, saver_anim_frames[frame]);
+  display.sendBuffer();
+  frame = (frame + 1) % SAVER_ANIM_FRAME_COUNT;
+}
+
+void updateSaver() {
+  uint32_t t = millis();
+  bool active = anyNoteSounding() || pressure_lin > pressure_tresh || mod > 5 ||
+                btnA.isPressed() || btnB.isPressed() || reset_active;
+  if (active) last_activity = t;
+  
+  uint32_t idle = t - last_activity;
+  SaverState want = idle > saver_off_ms ? SV_BLANK : (idle > saver_anim_ms ? SV_ANIM : SV_AWAKE);
+
+  if (saver != SV_AWAKE && want == SV_AWAKE && (btnA.isPressed() || btnB.isPressed())) swallow_next = true;
+  setSaver(want);
+}
 
 void loadSettings() {
   prefs.begin("isoflute", false);
@@ -155,11 +205,6 @@ float applyCurve(float x) {
     case S_CURVE: return x * x * (3.0f - 2.0f * x);
     default: return x;
   }
-}
-
-bool anyNoteSounding() {
-  for (uint8_t k = 0; k < 32; k++) if (sounding_note[k] != 255) return true;
-  return false;
 }
 
 void sendNote(bool on, uint8_t note, uint8_t vel) {
@@ -325,65 +370,58 @@ void changeCurve(int8_t delta) {
   markSettingsDirty();
 }
 
-void onA(Button2&) {
-  switch(ui) {
-    case UI_OCT: changeOctave(-1); need_full = true; break;
-    case UI_SENS: 
-      pressure_range_hpa--; 
-      if (pressure_range_hpa < 1) pressure_range_hpa = 1;
-      need_full = true; 
-      markSettingsDirty(); 
-      break;
-    case UI_TRESH: 
-      pressure_tresh--; 
-      if (pressure_tresh < 1) pressure_tresh = 1;
-      need_full = true;
-      markSettingsDirty(); 
-      break;
-    case UI_CURVE: changeCurve(-1); need_full = true; break;
-    case UI_CH: changeChannel(-1); need_full = true; break;
-    case UI_SENDPRS: sendPressure = true; need_full = true; markSettingsDirty(); break;
-    case UI_SENDVEL: sendVel = false; need_full = true; markSettingsDirty(); break;
+void menuValue(uint8_t i, char* buf, size_t n) {
+  switch (i) {
+    case 0: snprintf(buf, n, "%.0f", pressure_range_hpa); break;
+    case 1: snprintf(buf, n, "%d", pressure_tresh); break;
+    case 2: snprintf(buf, n, "%s", curve_names[breath_curve]); break;
+    case 3: snprintf(buf, n, "%d", midi_channel); break;
+    case 4: snprintf(buf, n, "%s", sendPressure ? "PRS" : "AFT"); break;
+    case 5: snprintf(buf, n, "%s", sendVel ? "YES" : "NO"); break;
   }
 }
 
+void menuChange(uint8_t i, int8_t d) {
+  switch (i) {
+    case 0: pressure_range_hpa = constrain(pressure_range_hpa + d, 1, 20); break;
+    case 1: pressure_tresh = constrain(pressure_tresh + d, 0, 20); break;
+    case 2: changeCurve(d); return;
+    case 3: changeChannel(d); return;
+    case 4: sendPressure = !sendPressure; break;
+    case 5: sendVel = !sendVel; break;
+  }
+  markSettingsDirty();
+}
+
+void onA(Button2&) {
+  if (both) return;
+  if (swallow_next) { swallow_next = false; return;}
+  switch (ui) {
+    case UI_PLAY: changeOctave(-1); break;
+    case UI_MENU: menu_sel = (menu_sel + 1) % menu_items; break;
+    case UI_EDIT: menuChange(menu_sel, -1); break;
+  }
+  need_full = true;
+}
+
 void onBReleased(Button2& b) {
+  if (both) return;
+  if (swallow_next) { swallow_next = false; return;}
   bool isLong = b.wasPressedFor() >= long_press;
-  switch(ui) {
-    case UI_OCT: 
-      if (isLong) ui = UI_SENS; else changeOctave(+1); need_full = true;
+  switch (ui) {
+    case UI_PLAY:
+      if(isLong) ui = UI_MENU; else changeOctave(+1);
       break;
-    case UI_SENS:
-      if (isLong) ui = UI_TRESH; else {
-        pressure_range_hpa++;
-        if (pressure_range_hpa > 20) pressure_range_hpa = 20;              
-      }
-      markSettingsDirty();
-      need_full = true;
+    case UI_MENU:
+      if (isLong) ui = UI_PLAY;
+      else if (menuIsToggle(menu_sel)) menuChange(menu_sel, +1);
+      else ui = UI_EDIT;
       break;
-    case UI_TRESH:
-      if (isLong) ui = UI_CURVE; else {
-        pressure_tresh++;
-        if (pressure_tresh > 20) pressure_tresh = 20;        
-      }
-      markSettingsDirty();
-      need_full = true;
-      break;
-    case UI_CURVE:
-      if (isLong) ui = UI_CH; else changeCurve(+1); need_full = true;
-      break;
-    case UI_CH: 
-      if (isLong) ui = UI_SENDPRS; else changeChannel(+1); need_full = true;
-      break;
-    case UI_SENDPRS:
-      if (isLong) ui = UI_SENDVEL; else sendPressure = false; need_full = true;
-      markSettingsDirty();
-      break;
-    case UI_SENDVEL:
-      if (isLong) ui = UI_OCT; else sendVel = true; need_full = true;
-      markSettingsDirty();
+    case UI_EDIT:
+      if (isLong) ui = UI_MENU; else menuChange(menu_sel, +1);
       break;
   }
+  need_full = true;
 }
 
 void checkBoth(){
@@ -394,10 +432,56 @@ void checkBoth(){
     reset_active = true;
     reset_drawn = false;
     reset_start = millis();
-    ui = UI_OCT;
+    ui = UI_PLAY;
   } else if ( !a && !b) {
     both = false;
+    swallow_next = false;
   }
+}
+
+void drawPlay() {
+  for (int i = 0; i < 7; i++) display.drawCircle(i*15+19, 58, 4);
+  display.drawDisc((oct)*15+65, 58, 4);
+
+  int dotsize = map(pressure, 0, 127, 2, 15);
+  int doty = map(bend, 0, 16383, 54, 10);
+  int dotx = SCREEN_WIDTH / 2 + (int)(map(mod, 0, 127, 0, 10) * sinf(millis() / 35.0f));
+  if (anyNoteSounding()) display.drawDisc(dotx, doty, dotsize);
+  else display.drawCircle(dotx, doty, dotsize);
+}
+
+void drawMenu() {
+  const uint8_t row_h = 16;
+  if (menu_sel < menu_top) menu_top = menu_sel; // Scroll
+  if (menu_sel >= menu_top + menu_rows) menu_top = menu_sel - menu_rows + 1;
+
+  for (uint8_t r = 0; r < menu_rows; r++) {
+    uint8_t i = menu_top + r;
+    if (i >= menu_items) break;
+    uint8_t top = r * row_h, base = top + 12;
+    bool sel = (i == menu_sel);
+    bool editing = sel && ui == UI_EDIT;
+
+    char val[16], txt[20];
+    menuValue(i, val, sizeof(val));
+    snprintf(txt, sizeof(txt), editing ? "<%s>" : "%s", val);
+
+    if (sel) {
+      display.setDrawColor(1);
+      display.drawBox(0, top, SCREEN_WIDTH - 6, row_h);
+      display.setDrawColor(0);
+    }
+    display.setCursor(4, base);
+    display.print(menu_names[i]);
+    display.setCursor(SCREEN_WIDTH - 10 - display.getStrWidth(txt), base);
+    display.print(txt);
+    display.setDrawColor(1);
+  }
+
+  uint8_t thumb_h = SCREEN_HEIGHT * menu_rows / menu_items;
+  uint8_t thumb_y = (SCREEN_HEIGHT - thumb_h) * menu_top / (menu_items - menu_rows);
+  display.drawVLine(SCREEN_WIDTH - 2, 0, SCREEN_WIDTH);
+  display.drawBox(SCREEN_WIDTH - 3, thumb_y, 3, thumb_h);
 }
 
 void updateDisplay() {
@@ -422,74 +506,15 @@ void updateDisplay() {
     need_full = true;
   }
 
-  // Menu handling
-  switch (ui) {      
-    case UI_SENS:
-      display.drawRFrame(28, 24, 72, 18, 2);
-      display.setCursor(32, 38);
-      display.print("RANGE:");
-      display.setCursor(81, 38);
-      display.print(pressure_range_hpa, 0);
-      break;
-    case UI_TRESH:
-      display.drawRFrame(24, 24, 80, 18, 2);
-      display.setCursor(28, 38);
-      display.print("TRESH:");
-      display.setCursor(77, 38);
-      display.print(pressure_tresh, 1);
-      break;
-    case UI_CURVE:
-      display.drawRFrame(4, 24, 120, 18, 2);
-      display.setCursor(11, 38);
-      display.print("CURVE:");
-      display.setCursor(60, 38);
-      display.print(curve_names[breath_curve]);
-      break;
-    case UI_CH:
-      display.drawRFrame(37, 24, 50, 18, 2);
-      display.setCursor(41, 38);
-      display.print("CH:");
-      display.setCursor(68, 38);
-      display.print(midi_channel);
-      break;
-    case UI_SENDPRS:
-      display.drawRFrame(31, 24, 66, 18, 2);
-      display.setCursor(35, 38);
-      display.print("SEND");
-      display.setCursor(70, 38);
-      if (sendPressure) display.print("PRS");
-      else if (!sendPressure) display.print("AFT");
-      break;
-    case UI_SENDVEL:
-      display.drawRFrame(31, 24, 66, 18, 2);
-      display.setCursor(35, 38);
-      display.print("VEL:");
-      display.setCursor(70, 38);
-      if (sendVel) display.print("YES");
-      else if (!sendVel) display.print("NO");
-      break;
-    default:
-      for (int i = 0; i < 7; i++) {
-        display.drawCircle(i*15+19, 58, 4);
-      }
-      display.drawDisc((oct)*15+65, 58, 4);
+  if (ui == UI_PLAY) drawPlay(); else drawMenu();
 
-      int dotsize = map(pressure, 0, 127, 2, 15);
-      int doty = map(bend, 0, 16383, 54, 10);
-      uint32_t now = millis();
-      int dotx = SCREEN_WIDTH / 2 + (int)(map(mod, 0, 127, 0, 10) * sinf(millis() / 35.0f));
-      if (anyNoteSounding()) display.drawDisc(dotx, doty, dotsize);
-      else display.drawCircle(dotx, doty, dotsize);
-      break;
-  }
-
-  // Only update the whole screen if it needs to
-  if (need_full) {
+  if (need_full || ui != UI_PLAY) {
     display.sendBuffer();
     need_full = false;
   } else {
     display.updateDisplayArea(4, 0, 8, 8);
   }
+
 }
 
 void setup() { 
@@ -507,7 +532,7 @@ void setup() {
   btnA.begin(BUTTONA_PIN);
   btnB.begin(BUTTONB_PIN);
 
-  btnB.setPressedHandler(onA);
+  btnB.setReleasedHandler(onA);
   btnA.setReleasedHandler(onBReleased);
 
   // Mux setup
@@ -563,12 +588,6 @@ void setup() {
   // Set range and data rate for accelerometer
   acc.setRange(ADXL345_RANGE_2_G);
   acc.setDataRate(ADXL345_DATARATE_100_HZ);
-
-  //ax = acc.getX();
-  //ay = acc.getY();
-  //az = acc.getZ();
-
-  //tilt_smooth = readAngle();
 
   Serial.println("ADXL345 sensor found!");
 
@@ -636,23 +655,29 @@ void loop() {
   updateTilt();
   
   // Key handling
-  uint32_t now = millis(); // Get the current time in milliseconds
   if (pressure_lin > pressure_tresh) { // If pressure is below threshold, skip processing
     scanKeys();
   } else {
     releaseAll();
   }
+  
+  updateSaver();
 
   // Update display
   uint32_t t = millis();
-  bool sounding = anyNoteSounding();
-  bool dirty = need_full || mod > 5 || pressure != shown_pressure || bend != shown_bend || sounding != shown_sounding || reset_active;
-  if (dirty && t - last_display_update_time >= 40) {
-    last_display_update_time = t;
-    shown_pressure = pressure; shown_bend = bend; shown_sounding = sounding;
-    updateDisplay();
+  if (saver == SV_ANIM) {
+    if (t - last_display_update_time >= 100) { last_display_update_time = t; drawSaver(); }
+  } else if (saver == SV_AWAKE) {
+    bool sounding = anyNoteSounding();
+    bool dirty = need_full || reset_active ||
+      (ui == UI_PLAY && (mod > 5 || pressure != shown_pressure || bend != shown_bend || sounding != shown_sounding));
+    if (dirty && t - last_display_update_time >= 40) {
+      last_display_update_time = t;
+      shown_pressure = pressure; shown_bend = bend; shown_sounding = sounding;
+      updateDisplay();
+    }
   }
-
+  
   // Save settings
   if (prefs_dirty && millis() - prefs_changed > 2000 && !anyNoteSounding()) saveSettings();
 }
